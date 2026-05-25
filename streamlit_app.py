@@ -117,14 +117,25 @@ def run_with_progress(api_key: str, lookback: int):
     total_steps = len(nat_hs_codes) + len(reg_calls)
 
     # ── UI 요소 ──────────────────────────────────────────────────
-    st.markdown("### 📡 데이터 수집 중...")
-    progress_bar  = st.progress(0)
-    status_text   = st.empty()
-    detail_text   = st.empty()
+    st.markdown("---")
+    st.markdown("### 📡 데이터 수집 중... 잠시 기다려 주세요")
 
-    # 섹터별 완료 현황
+    # 전체 진행 바
+    progress_bar = st.progress(0, text="준비 중...")
+
+    # 현재 작업 표시 (굵은 텍스트)
+    status_box = st.container()
+    with status_box:
+        status_text  = st.empty()   # 현재 섹터/종목
+        detail_text  = st.empty()   # HS코드 상세
+
+    # 완료된 섹터 목록
+    st.markdown("**완료된 항목**")
     sector_status = st.empty()
     sector_done   = {}
+
+    st.markdown("---")
+    st.caption("⏳ 처음 실행 시 약 5~10분 소요됩니다. 이후 24시간 캐시됩니다.")
 
     results = {
         "national": {}, "company": {},
@@ -138,14 +149,18 @@ def run_with_progress(api_key: str, lookback: int):
         nonlocal step
         step += 1
         pct = min(int(step / total_steps * 100), 99)
-        progress_bar.progress(pct)
-        status_text.markdown(f"**{pct}%** — {msg}")
+        # 진행 바 + 텍스트 동시 업데이트
+        progress_bar.progress(pct, text=f"{pct}% 진행 중 — {msg}")
+        status_text.info(f"🔄 **{msg}**")
         if detail:
-            detail_text.caption(detail)
-        # 섹터 현황 표시
-        done_list = " ".join(f"✅ {s}" for s in sector_done)
-        if done_list:
-            sector_status.caption(f"완료: {done_list}")
+            detail_text.caption(f"└ {detail}")
+        # 완료 섹터 목록
+        if sector_done:
+            cols_per_row = 4
+            items = list(sector_done.keys())
+            rows  = [items[i:i+cols_per_row] for i in range(0, len(items), cols_per_row)]
+            lines = ["  ".join(f"✅ `{s}`" for s in row) for row in rows]
+            sector_status.markdown("  \n".join(lines))
 
     # ── Part A: 전국 섹터 ─────────────────────────────────────────
     status_text.markdown("**Part A 시작** — 국가 섹터 데이터 수집")
@@ -224,10 +239,12 @@ def run_with_progress(api_key: str, lookback: int):
         sector_done[label] = True
 
     # ── 완료 ─────────────────────────────────────────────────────
-    progress_bar.progress(100)
-    status_text.empty()
+    progress_bar.progress(100, text="✅ 완료!")
+    status_text.success("🎉 모든 데이터 수집 완료!")
     detail_text.empty()
-    sector_status.empty()
+    # 완료 섹터 전체 표시
+    all_done = "  ".join(f"✅ `{s}`" for s in sector_done)
+    sector_status.markdown(all_done)
 
     return results
 
@@ -243,18 +260,25 @@ if run_btn:
     if not api_key:
         st.error("API 키를 입력하세요.")
     else:
-        # 캐시 확인 먼저
-        try:
-            cached = cached_run(api_key, lookback)
-            st.session_state.results = cached
-            st.success(f"✅ 캐시 로드 완료! ({cached['meta']['sp']} ~ {cached['meta']['ep']})")
-        except Exception:
-            # 캐시 없으면 진행 표시하며 실행
+        # 캐시 키: API키 앞 8자리 + lookback 조합
+        _ck = f"{api_key[:8]}_{lookback}"
+        _cached_keys = st.session_state.get("_cache_keys", set())
+
+        if _ck in _cached_keys:
+            # ── 캐시 히트: 즉시 로드 ────────────────────────────
+            with st.spinner("캐시에서 로드 중..."):
+                results = cached_run(api_key, lookback)
+            st.session_state.results = results
+            st.success(f"✅ 즉시 로드 완료 (캐시)  |  {results['meta']['sp']} ~ {results['meta']['ep']}")
+            st.rerun()
+        else:
+            # ── 최초 실행: 진행창 표시 ──────────────────────────
             try:
                 results = run_with_progress(api_key, lookback)
-                # 결과를 캐시에도 저장
                 st.session_state.results = results
-                st.success(f"✅ 분석 완료! ({results['meta']['sp']} ~ {results['meta']['ep']})")
+                _cached_keys.add(_ck)
+                st.session_state["_cache_keys"] = _cached_keys
+                st.success(f"✅ 분석 완료!  |  {results['meta']['sp']} ~ {results['meta']['ep']}")
                 st.rerun()
             except Exception as e:
                 st.error(f"오류 발생: {e}")
