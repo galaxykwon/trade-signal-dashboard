@@ -1,5 +1,5 @@
 """
-수출입 무역통계 투자 시그널 대시보드
+수출입 무역통계 기반 투자
 Streamlit Cloud 배포용
 """
 
@@ -68,6 +68,8 @@ with st.sidebar:
     st.caption("📌 관세청 수출입 무역통계")
     st.caption("📅 통계는 1~2개월 지연 공표")
     st.caption("⚠️ 투자 참고용, 권유 아님")
+    st.caption("✨ by Galaxy")
+
 
 # ── 진행 상태 표시용 run 함수 ────────────────────────────────────
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -118,7 +120,7 @@ def run_with_progress(api_key: str, lookback: int):
 
     # ── UI 요소 ──────────────────────────────────────────────────
     st.markdown("---")
-    st.markdown("### 📡 데이터 수집 중... 잠시 기다려 주세요")
+    st.markdown("### 📡 데이터 수집 중... 잠시 기다려 주세요(매일 첫 실행 시 5분 이상 소요됩니다)")
 
     # 전체 진행 바
     progress_bar = st.progress(0, text="준비 중...")
@@ -249,7 +251,7 @@ def run_with_progress(api_key: str, lookback: int):
     return results
 
 # ── 메인 헤더 ────────────────────────────────────────────────────
-st.title("📊 수출입 무역통계 투자 시그널 대시보드")
+st.title("📊 수출입 무역통계 기반 투자 도우미")
 st.caption("관세청 HS코드 × 지역코드 기반 — 삼성전자·SK하이닉스 + 7개 섹터 통합 분석")
 
 # ── 실행 로직 ────────────────────────────────────────────────────
