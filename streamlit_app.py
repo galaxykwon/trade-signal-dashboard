@@ -75,11 +75,6 @@ with st.sidebar:
 #         → run_btn 클릭 시 results 가 이미 있으면 즉시 반환
 # ══════════════════════════════════════════════════════════════════
 
-@st.cache_data(ttl=86400, show_spinner=False)   # 서버 프로세스 레벨 24h 캐시
-def _cached_run(api_key: str, lookback: int):
-    from analyzer import run_all
-    return run_all(api_key, lookback)
-
 def run_with_progress(api_key: str, lookback: int):
     from analyzer import (
         NATIONAL_SECTORS, COMPANY_SECTORS, REGIONS,
@@ -215,43 +210,44 @@ if "results" not in st.session_state:
     st.session_state.results = None
 
 # Fix1 핵심: run_btn 클릭 시 처리
+# ── Fix: 버튼 클릭과 데이터 수집을 분리 ────────────────────────
+# 버튼은 need_run 플래그만 세우고 rerun → 다음 사이클에서 진행창 먼저 그린 뒤 수집
 if run_btn:
     if not api_key:
         st.error("API 키를 입력하세요.")
     else:
-        # session_state에 결과가 이미 있고 설정이 같으면 → 즉시 표시
         prev = st.session_state.get("_last_run", {})
-        same_config = (
-            prev.get("api_key") == api_key[:8] and
-            prev.get("lookback") == lookback
-        )
-        if same_config and st.session_state.results:
-            # 이미 수집된 데이터 → 바로 rerun(결과 탭으로 이동)
-            st.success("✅ 캐시 데이터 로드 (즉시)")
-            st.rerun()
+        same = (prev.get("api_key") == api_key[:8] and
+                prev.get("lookback") == lookback and
+                st.session_state.results is not None)
+        if same:
+            st.success("✅ 이미 분석된 결과입니다. 아래에서 확인하세요.")
+            # need_run 없이 그냥 진행 (결과가 이미 있음)
         else:
-            # 최초 실행 또는 설정 변경 → 진행창 표시
-            try:
-                # st.cache_data 서버 캐시 먼저 확인 (같은 프로세스 내 재실행 시 빠름)
-                results = _cached_run(api_key, lookback)
-                st.session_state.results = results
-                st.session_state["_last_run"] = {
-                    "api_key": api_key[:8], "lookback": lookback
-                }
-                st.success(f"✅ 분석 완료! | {results['meta']['sp']} ~ {results['meta']['ep']}")
-                st.rerun()
-            except Exception:
-                # 캐시 미스 → 진행창 표시하며 직접 수집
-                try:
-                    results = run_with_progress(api_key, lookback)
-                    st.session_state.results = results
-                    st.session_state["_last_run"] = {
-                        "api_key": api_key[:8], "lookback": lookback
-                    }
-                    st.success(f"✅ 분석 완료! | {results['meta']['sp']} ~ {results['meta']['ep']}")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"오류: {e}")
+            # 진행창을 먼저 그리기 위해 플래그만 세우고 rerun
+            st.session_state["need_run"]  = True
+            st.session_state["run_key"]   = api_key
+            st.session_state["run_lb"]    = lookback
+            st.session_state.results      = None
+            st.rerun()
+
+# ── need_run: 진행창 먼저 그린 뒤 수집 ─────────────────────────
+if st.session_state.get("need_run"):
+    _ak = st.session_state.get("run_key", "")
+    _lb = st.session_state.get("run_lb", 24)
+    if _ak:
+        try:
+            results = run_with_progress(_ak, _lb)
+            st.session_state.results = results
+            st.session_state["need_run"] = False
+            st.session_state["_last_run"] = {
+                "api_key": _ak[:8], "lookback": _lb
+            }
+            st.rerun()
+        except Exception as e:
+            st.session_state["need_run"] = False
+            st.error(f"오류: {e}")
+    st.stop()
 
 # ── 결과 없으면 안내 ─────────────────────────────────────────────
 if not st.session_state.results:
