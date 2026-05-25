@@ -69,11 +69,167 @@ with st.sidebar:
     st.caption("📅 통계는 1~2개월 지연 공표")
     st.caption("⚠️ 투자 참고용, 권유 아님")
 
-# ── 캐시 래퍼 ─────────────────────────────────────────────────────
-@st.cache_data(ttl=3600, show_spinner=False)
+# ── 진행 상태 표시용 run 함수 ────────────────────────────────────
+@st.cache_data(ttl=86400, show_spinner=False)
 def cached_run(api_key: str, lookback: int):
     from analyzer import run_all
     return run_all(api_key, lookback)
+
+def run_with_progress(api_key: str, lookback: int):
+    """
+    섹터별 진행 상황을 실시간으로 표시하며 분석 실행
+    캐시 히트 시 즉시 반환
+    """
+    import time as _time
+    from analyzer import (
+        NATIONAL_SECTORS, COMPANY_SECTORS, REGIONS,
+        fetch_national, fetch_region, pool, evaluate,
+        URL_NATIONAL, URL_REGION,
+    )
+    from datetime import datetime
+    from dateutil.relativedelta import relativedelta
+
+    today    = datetime.today()
+    end_dt   = today
+    start_dt = end_dt - relativedelta(months=lookback)
+    sp, ep   = start_dt.strftime("%Y%m"), end_dt.strftime("%Y%m")
+
+    # 전체 작업 수 계산
+    nat_hs_codes = set()
+    for cfg in NATIONAL_SECTORS.values():
+        for rule in cfg["signal_rules"].values():
+            nat_hs_codes.update(rule["codes"])
+
+    reg_calls = []
+    for cfg in COMPANY_SECTORS.values():
+        reg_codes = [REGIONS[r] for r in cfg["export_regions"] if r in REGIONS]
+        for rule in cfg["export_rules"].values():
+            for hs in rule["codes"]:
+                for rc in reg_codes:
+                    reg_calls.append((hs, rc))
+        if cfg["capex_rule"]:
+            cap_codes = [REGIONS[r] for r in cfg["capex_regions"] if r in REGIONS]
+            for hs in cfg["capex_rule"]["codes"]:
+                for rc in cap_codes:
+                    reg_calls.append((hs, rc))
+    reg_calls = list(set(reg_calls))
+
+    total_steps = len(nat_hs_codes) + len(reg_calls)
+
+    # ── UI 요소 ──────────────────────────────────────────────────
+    st.markdown("### 📡 데이터 수집 중...")
+    progress_bar  = st.progress(0)
+    status_text   = st.empty()
+    detail_text   = st.empty()
+
+    # 섹터별 완료 현황
+    sector_status = st.empty()
+    sector_done   = {}
+
+    results = {
+        "national": {}, "company": {},
+        "meta": {"sp": sp, "ep": ep, "generated": datetime.now().isoformat()}
+    }
+    national_cache: dict = {}
+    region_cache:   dict = {}
+    step = 0
+
+    def _update(msg: str, detail: str = ""):
+        nonlocal step
+        step += 1
+        pct = min(int(step / total_steps * 100), 99)
+        progress_bar.progress(pct)
+        status_text.markdown(f"**{pct}%** — {msg}")
+        if detail:
+            detail_text.caption(detail)
+        # 섹터 현황 표시
+        done_list = " ".join(f"✅ {s}" for s in sector_done)
+        if done_list:
+            sector_status.caption(f"완료: {done_list}")
+
+    # ── Part A: 전국 섹터 ─────────────────────────────────────────
+    status_text.markdown("**Part A 시작** — 국가 섹터 데이터 수집")
+    for sector, cfg in NATIONAL_SECTORS.items():
+        results["national"][sector] = {"icon": cfg["icon"], "signals": {}}
+        for sig_name, rule in cfg["signal_rules"].items():
+            dfs = []
+            for hs in rule["codes"]:
+                if hs not in national_cache:
+                    _update(
+                        f"[{sector}] {sig_name}",
+                        f"HS코드 {hs} 수집 중... ({sp}~{ep})"
+                    )
+                    national_cache[hs] = fetch_national(api_key, hs, sp, ep)
+                if not national_cache[hs].empty:
+                    dfs.append(national_cache[hs])
+            ev = evaluate(pool(dfs), rule["direction"], rule["threshold"])
+            ev["description"] = rule["desc"]
+            ev["direction"]   = rule["direction"]
+            ev["stocks"]      = rule["stocks"]
+            results["national"][sector]["signals"][sig_name] = ev
+        sector_done[sector] = True
+
+    # ── Part B: 핵심종목 ─────────────────────────────────────────
+    status_text.markdown("**Part B 시작** — 삼성전자·SK하이닉스 지역 데이터 수집")
+    for company, cfg in COMPANY_SECTORS.items():
+        label = f"{cfg['corp']} {cfg['seg']}"
+        results["company"][company] = {
+            "corp": cfg["corp"], "seg": cfg["seg"], "color": cfg["color"],
+            "export_signals": {}, "capex_signal": None,
+        }
+        exp_codes = [REGIONS[r] for r in cfg["export_regions"] if r in REGIONS]
+        for sig_name, rule in cfg["export_rules"].items():
+            dfs = []
+            for hs in rule["codes"]:
+                for rc in exp_codes:
+                    key = (hs, rc)
+                    if key not in region_cache:
+                        region_name = next(
+                            (k for k, v in REGIONS.items() if v == rc), rc
+                        )
+                        _update(
+                            f"[{label}] {sig_name}",
+                            f"HS {hs} @ {region_name} 수집 중..."
+                        )
+                        region_cache[key] = fetch_region(api_key, hs, rc, sp, ep)
+                    if not region_cache[key].empty:
+                        dfs.append(region_cache[key])
+            ev = evaluate(pool(dfs), "수출", rule["threshold"])
+            ev["description"] = rule["desc"]
+            results["company"][company]["export_signals"][sig_name] = ev
+
+        if cfg["capex_rule"]:
+            rule      = cfg["capex_rule"]
+            cap_codes = [REGIONS[r] for r in cfg["capex_regions"] if r in REGIONS]
+            dfs = []
+            for hs in rule["codes"]:
+                for rc in cap_codes:
+                    key = (hs, rc)
+                    if key not in region_cache:
+                        region_name = next(
+                            (k for k, v in REGIONS.items() if v == rc), rc
+                        )
+                        _update(
+                            f"[{label}] CAPEX — {rule['name']}",
+                            f"HS {hs} @ {region_name} 수집 중..."
+                        )
+                        region_cache[key] = fetch_region(api_key, hs, rc, sp, ep)
+                    if not region_cache[key].empty:
+                        dfs.append(region_cache[key])
+            ev = evaluate(pool(dfs), "수입", rule["threshold"])
+            ev["description"] = rule["desc"]
+            ev["rule_name"]   = rule["name"]
+            results["company"][company]["capex_signal"] = ev
+
+        sector_done[label] = True
+
+    # ── 완료 ─────────────────────────────────────────────────────
+    progress_bar.progress(100)
+    status_text.empty()
+    detail_text.empty()
+    sector_status.empty()
+
+    return results
 
 # ── 메인 헤더 ────────────────────────────────────────────────────
 st.title("📊 수출입 무역통계 투자 시그널 대시보드")
@@ -87,11 +243,19 @@ if run_btn:
     if not api_key:
         st.error("API 키를 입력하세요.")
     else:
-        with st.spinner("📡 데이터 수집 중... (약 5~10분 소요)"):
+        # 캐시 확인 먼저
+        try:
+            cached = cached_run(api_key, lookback)
+            st.session_state.results = cached
+            st.success(f"✅ 캐시 로드 완료! ({cached['meta']['sp']} ~ {cached['meta']['ep']})")
+        except Exception:
+            # 캐시 없으면 진행 표시하며 실행
             try:
-                results = cached_run(api_key, lookback)
+                results = run_with_progress(api_key, lookback)
+                # 결과를 캐시에도 저장
                 st.session_state.results = results
                 st.success(f"✅ 분석 완료! ({results['meta']['sp']} ~ {results['meta']['ep']})")
+                st.rerun()
             except Exception as e:
                 st.error(f"오류 발생: {e}")
 
