@@ -75,6 +75,38 @@ with st.sidebar:
 #         → run_btn 클릭 시 results 가 이미 있으면 즉시 반환
 # ══════════════════════════════════════════════════════════════════
 
+# ── 파일 캐시 경로 (Streamlit Cloud /tmp 는 세션 간 유지됨) ──────
+import os, hashlib, pickle
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+_CACHE_DIR = "/tmp/trade_cache"
+os.makedirs(_CACHE_DIR, exist_ok=True)
+
+def _cache_path(api_key: str, lookback: int) -> str:
+    h = hashlib.md5(f"{api_key}{lookback}".encode()).hexdigest()[:12]
+    return os.path.join(_CACHE_DIR, f"results_{h}.pkl")
+
+def _load_file_cache(api_key: str, lookback: int):
+    """24시간 파일 캐시 로드. 없거나 만료되면 None 반환."""
+    import time
+    path = _cache_path(api_key, lookback)
+    if os.path.exists(path):
+        age = time.time() - os.path.getmtime(path)
+        if age < 86400:  # 24시간
+            try:
+                with open(path, "rb") as f:
+                    return pickle.load(f)
+            except Exception:
+                pass
+    return None
+
+def _save_file_cache(api_key: str, lookback: int, results: dict):
+    try:
+        with open(_cache_path(api_key, lookback), "wb") as f:
+            pickle.dump(results, f)
+    except Exception:
+        pass
+
 def run_with_progress(api_key: str, lookback: int):
     from analyzer import (
         NATIONAL_SECTORS, COMPANY_SECTORS, REGIONS,
@@ -135,26 +167,65 @@ def run_with_progress(api_key: str, lookback: int):
         "national": {}, "company": {},
         "meta": {"sp": sp, "ep": ep, "generated": datetime.now().isoformat()}
     }
+
+    # ── 병렬 수집: 모든 HS코드를 동시에 호출 (3~4배 빠름) ──────
+    _upd("전체 HS코드 병렬 수집 시작", f"총 {len(nat_hs)}개 전국 + {len(reg_calls)}개 지역 코드")
+
     nat_cache: dict = {}
     reg_cache: dict = {}
 
-    # Part A
+    # 전국 코드 병렬 수집
+    def _fetch_nat(hs):
+        return hs, fetch_national(api_key, hs, sp, ep)
+
+    def _fetch_reg(args):
+        hs, rc = args
+        return (hs, rc), fetch_region(api_key, hs, rc, sp, ep)
+
+    nat_done_count = [0]
+    reg_done_count = [0]
+
+    with ThreadPoolExecutor(max_workers=5) as ex:
+        # 전국 먼저
+        nat_futs = {ex.submit(_fetch_nat, hs): hs for hs in nat_hs}
+        for fut in as_completed(nat_futs):
+            hs, df = fut.result()
+            nat_cache[hs] = df
+            nat_done_count[0] += 1
+            _upd(
+                f"전국 수집 {nat_done_count[0]}/{len(nat_hs)} 완료",
+                f"HS {hs}"
+            )
+
+    with ThreadPoolExecutor(max_workers=5) as ex:
+        # 지역 코드
+        reg_futs = {ex.submit(_fetch_reg, call): call for call in reg_calls}
+        for fut in as_completed(reg_futs):
+            key, df = fut.result()
+            reg_cache[key] = df
+            reg_done_count[0] += 1
+            hs, rc = key
+            rname = next((n for n, v in REGIONS.items() if v == rc), rc)
+            _upd(
+                f"지역 수집 {reg_done_count[0]}/{len(reg_calls)} 완료",
+                f"HS {hs} @ {rname}"
+            )
+
+    # ── 시그널 평가 (빠름) ──────────────────────────────────────
+    _upd("시그널 평가 중...", "")
+
     for sector, cfg in NATIONAL_SECTORS.items():
         results["national"][sector] = {"icon": cfg["icon"], "signals": {}}
         for sig_name, rule in cfg["signal_rules"].items():
-            dfs = []
-            for hs in rule["codes"]:
-                if hs not in nat_cache:
-                    _upd(f"[{sector}] {sig_name}", f"HS {hs} ({sp}~{ep})")
-                    nat_cache[hs] = fetch_national(api_key, hs, sp, ep)
-                if not nat_cache[hs].empty:
-                    dfs.append(nat_cache[hs])
+            dfs = [nat_cache[hs] for hs in rule["codes"]
+                   if hs in nat_cache and not nat_cache[hs].empty]
             ev = evaluate(pool(dfs), rule["direction"], rule["threshold"])
-            ev.update({"description": rule["desc"], "direction": rule["direction"], "stocks": rule["stocks"]})
+            ev.update({"description": rule["desc"],
+                       "direction": rule["direction"],
+                       "stocks": rule["stocks"]})
             results["national"][sector]["signals"][sig_name] = ev
         done[sector] = True
 
-    # Part B
     for company, cfg in COMPANY_SECTORS.items():
         label = f"{cfg['corp']} {cfg['seg']}"
         results["company"][company] = {
@@ -163,16 +234,9 @@ def run_with_progress(api_key: str, lookback: int):
         }
         ecodes = [REGIONS[r] for r in cfg["export_regions"] if r in REGIONS]
         for sig_name, rule in cfg["export_rules"].items():
-            dfs = []
-            for hs in rule["codes"]:
-                for rc in ecodes:
-                    k = (hs, rc)
-                    if k not in reg_cache:
-                        rname = next((n for n, v in REGIONS.items() if v == rc), rc)
-                        _upd(f"[{label}] {sig_name}", f"HS {hs} @ {rname}")
-                        reg_cache[k] = fetch_region(api_key, hs, rc, sp, ep)
-                    if not reg_cache[k].empty:
-                        dfs.append(reg_cache[k])
+            dfs = [reg_cache[(hs, rc)]
+                   for hs in rule["codes"] for rc in ecodes
+                   if (hs, rc) in reg_cache and not reg_cache[(hs, rc)].empty]
             ev = evaluate(pool(dfs), "수출", rule["threshold"])
             ev["description"] = rule["desc"]
             results["company"][company]["export_signals"][sig_name] = ev
@@ -180,21 +244,17 @@ def run_with_progress(api_key: str, lookback: int):
         if cfg["capex_rule"]:
             rule   = cfg["capex_rule"]
             ccodes = [REGIONS[r] for r in cfg["capex_regions"] if r in REGIONS]
-            dfs = []
-            for hs in rule["codes"]:
-                for rc in ccodes:
-                    k = (hs, rc)
-                    if k not in reg_cache:
-                        rname = next((n for n, v in REGIONS.items() if v == rc), rc)
-                        _upd(f"[{label}] CAPEX", f"HS {hs} @ {rname}")
-                        reg_cache[k] = fetch_region(api_key, hs, rc, sp, ep)
-                    if not reg_cache[k].empty:
-                        dfs.append(reg_cache[k])
+            dfs = [reg_cache[(hs, rc)]
+                   for hs in rule["codes"] for rc in ccodes
+                   if (hs, rc) in reg_cache and not reg_cache[(hs, rc)].empty]
             ev = evaluate(pool(dfs), "수입", rule["threshold"])
             ev.update({"description": rule["desc"], "rule_name": rule["name"]})
             results["company"][company]["capex_signal"] = ev
 
         done[label] = True
+
+    # 파일 캐시 저장 (24시간 유지)
+    _save_file_cache(api_key, lookback, results)
 
     prog.progress(100, text="✅ 완료!")
     cur_task.success("🎉 모든 데이터 수집 완료!")
@@ -236,17 +296,24 @@ if st.session_state.get("need_run"):
     _ak = st.session_state.get("run_key", "")
     _lb = st.session_state.get("run_lb", 24)
     if _ak:
-        try:
-            results = run_with_progress(_ak, _lb)
-            st.session_state.results = results
+        # 파일 캐시 먼저 확인 (24시간 유효)
+        cached = _load_file_cache(_ak, _lb)
+        if cached:
+            st.session_state.results  = cached
             st.session_state["need_run"] = False
-            st.session_state["_last_run"] = {
-                "api_key": _ak[:8], "lookback": _lb
-            }
+            st.session_state["_last_run"] = {"api_key": _ak[:8], "lookback": _lb}
+            st.success("✅ 캐시 로드 완료 (즉시)")
             st.rerun()
-        except Exception as e:
-            st.session_state["need_run"] = False
-            st.error(f"오류: {e}")
+        else:
+            try:
+                results = run_with_progress(_ak, _lb)
+                st.session_state.results  = results
+                st.session_state["need_run"] = False
+                st.session_state["_last_run"] = {"api_key": _ak[:8], "lookback": _lb}
+                st.rerun()
+            except Exception as e:
+                st.session_state["need_run"] = False
+                st.error(f"오류: {e}")
     st.stop()
 
 # ── 결과 없으면 안내 ─────────────────────────────────────────────
